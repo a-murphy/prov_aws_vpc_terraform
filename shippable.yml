@@ -1,102 +1,79 @@
 resources:
-# Automation scripts repo
-  - name: aws_vpc_tf_repo
-    type: gitRepo
-    integration: "dr_gh"
-    versionTemplate:
-      sourceName: "devops-recipes/prov_aws_vpc_terraform"
-      branch: master
+  - name: terraform_scripts_repository
+    type: GitRepo
+    configuration:
+      gitProvider: githubIntegration
+      path: "a-murphy/prov_aws_vpc_terraform"
+      branches:
+        include: ^{{gitBranch}}$
 
-# Terraform State
-  - name: aws_vpc_tf_state
-    type: state
-
-# Output of VPC provisioning
-  - name: aws_vpc_tf_info
-    type: params
+  - name: terraform_info
+    type: PropertyBag
     versionTemplate:
       params:
         SEED: "initial_version"
 
-jobs:
-# Provision AWS VPC with Terraform
-  - name: prov_aws_vpc_tr
-    type: runSh
-    integrations:
-      - dr_aws
+pipelines:
+  - name: Terraform
+    configuration:
+      environmentVariables:
+        readOnly:
+          GCP_REGION: "us-central1"
+          GCP_ZONE: "us-central1-a"
     steps:
-      - IN: aws_vpc_tf_repo
-      - IN: aws_vpc_tf_state
-        switch: off
-      - TASK:
-          name: prov_vpc
-          runtime:
-            options:
-              env:
-                - vpc_region: "us-east-1"
-                - vpc_name: "demo_vpc_tf"
-                - vpc_cidr_block: "10.10.0.0/16"
-                - vpc_access_from_ip_range: "0.0.0.0/0"
-                - vpc_public_subnet_1_cidr: "10.10.10.0/24"
-                - vpc_private_subnet_1_cidr: "10.10.11.0/24"
-          script:
-            - pushd $(shipctl get_resource_state "aws_vpc_tf_repo")
-            - export AWS_ACCESS_KEY_ID=$(shipctl get_integration_field dr_aws "accessKey")
-            - export AWS_SECRET_ACCESS_KEY=$(shipctl get_integration_field dr_aws "secretKey")
-            - shipctl copy_file_from_resource_state aws_vpc_tf_state terraform.tfstate .
-            - shipctl replace terraform.tfvars
+      - name: provision_GKE_cluster
+        type: Bash
+        integrations:
+          - name: googleCloudIntegration
+        inputResources:
+          - name: terraform_scripts_repository
+        outputResources:
+          - name: terraform_info
+        execution:
+          onExecute:
+            - pushd $res_terraform_scripts_repository_resourcePath
+            - export GCP_PROJECT_NAME=$( echo "$int_googleCloudIntegration_jsonKey" | jq -r '.project_id' )
+            - echo "$int_googleCloudIntegration_jsonKey" > myGoogleCloudKey
+            - export GOOGLE_APPLICATION_CREDENTIALS=$res_terraform_scripts_repository_resourcePath/myGoogleCloudKey
+            - restore_pipeline_files terraform_state terraform.tfstate
+            - replace_envs terraform.tfvars
             - terraform init
             - terraform apply -auto-approve -var-file=terraform.tfvars
-      - OUT: aws_vpc_tf_info
-        overwrite: true
-      - OUT: aws_vpc_tf_state
-    on_success:
-      script:
-        - shipctl put_resource_state_multi aws_vpc_tf_info "versionName=$vpc_name" "vpc_id=$(terraform output vpc_id)" "vpc_region=$vpc_region" "vpc_public_sg_id=$(terraform output vpc_public_sg_id)" "vpc_public_sn_id=$(terraform output vpc_public_sn_id)" "vpc_private_sg_id=$(terraform output vpc_private_sg_id)" "vpc_private_sn_id=$(terraform output vpc_private_sn_id)"
-    always:
-      script:
-        - shipctl copy_file_to_resource_state terraform.tfstate aws_vpc_tf_state
-        - popd
-    flags:
-      - aws_vpc
-      - aws
-      - terraform
+          onSuccess:
+            - write_output terraform_info "cluster_name=my-vpc-native-cluster" "cluster_endpoint=$(terraform output endpoint)"
+          onComplete:
+            - add_pipeline_files terraform.tfstate terraform_state
+            - popd
 
-## De-Provision VPC
-#  - name: deprov_aws_vpc_tf
-#    type: runSh
-#    integrations:
-#      - dr_aws
-#    steps:
-#      - IN: aws_vpc_tf_repo
-#      - IN: aws_vpc_tf_state
-#        switch: off
-#      - IN: aws_vpc_tf_info
-#        switch: off
-#      - TASK:
-#          name: deprov_vpc
-#          runtime:
-#            options:
-#              env:
-#                - vpc_region: "us-east-1"
-#                - vpc_name: "demo_vpc_tf"
-#                - vpc_cidr_block: "10.10.0.0/16"
-#                - vpc_access_from_ip_range: "0.0.0.0/0"
-#                - vpc_public_subnet_1_cidr: "10.10.10.0/24"
-#                - vpc_private_subnet_1_cidr: "10.10.11.0/24"
-#          script:
-#            - export AWS_ACCESS_KEY_ID=$(shipctl get_integration_field dr_aws "accessKey")
-#            - export AWS_SECRET_ACCESS_KEY=$(shipctl get_integration_field dr_aws "secretKey")
-#            - pushd $(shipctl get_resource_state "aws_vpc_tf_repo")
-#            - shipctl copy_file_from_resource_state aws_vpc_tf_state terraform.tfstate .
-#            - shipctl replace terraform.tfvars
-#            - terraform init
-#            - terraform destroy -force -auto-approve -var-file=terraform.tfvars
-#      - OUT: aws_vpc_tf_state
-#    always:
-#      script:
-#        - shipctl copy_file_to_resource_state terraform.tfstate aws_vpc_tf_state
-#    flags:
-#      - aws_vpc
-#      - aws
-#      - terraform
+      - name: deprovision_GKE_cluster
+        type: Bash
+        integrations:
+          - name: googleCloudIntegration
+        inputResources:
+          - name: terraform_scripts_repository
+            trigger: false
+        execution:
+          onExecute:
+            - pushd $res_terraform_scripts_repository_resourcePath
+            - export GCP_PROJECT_NAME=$( echo "$int_googleCloudIntegration_jsonKey" | jq -r '.project_id' )
+            - echo "$int_googleCloudIntegration_jsonKey" > myGoogleCloudKey
+            - export GOOGLE_APPLICATION_CREDENTIALS=$res_terraform_scripts_repository_resourcePath/myGoogleCloudKey
+            - restore_pipeline_files terraform_state terraform.tfstate
+            - replace_envs terraform.tfvars
+            - terraform init
+            - terraform destroy -force -auto-approve -var-file=terraform.tfvars
+          onComplete:
+            - add_pipeline_files terraform.tfstate terraform_state
+  - name: Requires_Terraform
+    steps:
+      - name: connect_to_cluster
+        type: Bash
+        integrations:
+          - name: googleCloudIntegration
+        inputResources:
+          - name: terraform_info
+        execution:
+          onExecute:
+            - gcloud container clusters get-credentials $res_terraform_info_cluster_name
+            - kubectl cluster-info
+            - kubectl get nodes
