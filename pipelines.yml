@@ -1,0 +1,83 @@
+resources:
+  - name: terraform_scripts_repository
+    type: GitRepo
+    configuration:
+      gitProvider: githubIntegration
+      path: "a-murphy/prov_aws_vpc_terraform"
+      branches:
+        include: ^{{gitBranch}}$
+
+  - name: terraform_info
+    type: PropertyBag
+    configuration:
+      cluster_name: ""
+
+pipelines:
+  - name: Terraform
+    configuration:
+      environmentVariables:
+        readOnly:
+          GCP_REGION: "us-central1"
+          GCP_ZONE: "us-central1-a"
+    steps:
+      - name: provision_GKE_cluster
+        type: Bash
+        configuration:
+          chronological: true
+          integrations:
+            - name: googleCloudIntegration
+          inputResources:
+            - name: terraform_scripts_repository
+          outputResources:
+            - name: terraform_info
+        execution:
+          onExecute:
+            - pushd $res_terraform_scripts_repository_resourcePath
+            - export GCP_PROJECT_NAME=$( echo "$int_googleCloudIntegration_jsonKey" | jq -r '.project_id' )
+            - echo "$int_googleCloudIntegration_jsonKey" > myGoogleCloudKey
+            - export GOOGLE_APPLICATION_CREDENTIALS=$res_terraform_scripts_repository_resourcePath/myGoogleCloudKey
+            - restore_pipeline_files terraform_state terraform.tfstate
+            - replace_envs terraform.tfvars
+            - terraform init
+            - terraform apply -auto-approve -var-file=terraform.tfvars
+          onSuccess:
+            - write_output terraform_info "cluster_name=$(terraform output cluster_name)" "cluster_endpoint=$(terraform output endpoint)" "cluster_zone=$(terraform output cluster_zone)"
+          onComplete:
+            - add_pipeline_files terraform.tfstate terraform_state
+
+      - name: deprovision_GKE_cluster
+        type: Bash
+        configuration:
+          chronological: true
+          integrations:
+            - name: googleCloudIntegration
+          inputResources:
+            - name: terraform_scripts_repository
+              trigger: false
+        execution:
+          onExecute:
+            - pushd $res_terraform_scripts_repository_resourcePath
+            - export GCP_PROJECT_NAME=$( echo "$int_googleCloudIntegration_jsonKey" | jq -r '.project_id' )
+            - echo "$int_googleCloudIntegration_jsonKey" > myGoogleCloudKey
+            - export GOOGLE_APPLICATION_CREDENTIALS=$res_terraform_scripts_repository_resourcePath/myGoogleCloudKey
+            - restore_pipeline_files terraform_state terraform.tfstate
+            - replace_envs terraform.tfvars
+            - terraform init
+            - terraform destroy -force -auto-approve -var-file=terraform.tfvars
+          onComplete:
+            - add_pipeline_files terraform.tfstate terraform_state
+
+  - name: Requires_Terraform
+    steps:
+      - name: connect_to_cluster
+        type: Bash
+        configuration:
+          integrations:
+            - name: googleCloudIntegration
+          inputResources:
+            - name: terraform_info
+        execution:
+          onExecute:
+            - gcloud container clusters get-credentials --zone=$res_terraform_info_cluster_zone $res_terraform_info_cluster_name
+            - kubectl cluster-info
+            - kubectl get nodes
